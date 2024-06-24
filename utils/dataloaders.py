@@ -1,4 +1,4 @@
-# Ultralytics YOLOv5 🚀, AGPL-3.0 license
+# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
 """Dataloaders and dataset utils."""
 
 import contextlib
@@ -56,6 +56,36 @@ from utils.general import (
     xyxy2xywhn,
 )
 from utils.torch_utils import torch_distributed_zero_first
+
+# Camdata
+import rospy
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from message_filters import Subscriber, ApproximateTimeSynchronizer
+
+# image transform
+bridge = CvBridge()
+
+def img_callback(data1, data2):
+    cv_image1 = bridge.imgmsg_to_cv2(data1, "bgr8")
+    cv_image2 = bridge.imgmsg_to_cv2(data2, "bgr8")
+    combine_image = image_combine(cv_image1,cv_image2)
+    combined_image_msg = bridge.cv2_to_imgmsg(combine_image, encoding='bgr8')
+    rgb_pub.publish(combined_image_msg)
+    
+def image_combine(cv_image1, cv_image2):
+    global combined_image
+    combined_image = cv2.hconcat([cv_image1, cv_image2])
+    return combined_image
+
+rospy.init_node('cam_data', anonymous=True)
+rgb1 = Subscriber("camera1/color/image_raw", Image)
+rgb2 = Subscriber("camera2/color/image_raw", Image)
+rgb_pub = rospy.Publisher('/multi_color_img', Image, queue_size=10)
+
+ats = ApproximateTimeSynchronizer([rgb1, rgb2], queue_size=10, slop=0.05)
+ats.registerCallback(img_callback)
+
 
 # Parameters
 HELP_URL = "See https://docs.ultralytics.com/yolov5/tutorials/train_custom_data"
@@ -136,7 +166,7 @@ class SmartDistributedSampler(distributed.DistributedSampler):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
-        # determine the eventual size (n) of self.indices (DDP indices)
+        # determine the the eventual size (n) of self.indices (DDP indices)
         n = int((len(self.dataset) - self.rank - 1) / self.num_replicas) + 1  # num_replicas == WORLD_SIZE
         idx = torch.randperm(n, generator=g)
         if not self.shuffle:
@@ -444,34 +474,21 @@ class LoadStreams:
         for i, s in enumerate(sources):  # index, source
             # Start thread to read frames from video stream
             st = f"{i + 1}/{n}: {s}... "
-            if urlparse(s).hostname in ("www.youtube.com", "youtube.com", "youtu.be"):  # if source is YouTube video
-                # YouTube format i.e. 'https://www.youtube.com/watch?v=Zgi9g1ksQHc' or 'https://youtu.be/LNwODJXcvt4'
-                check_requirements(("pafy", "youtube_dl==2020.12.2"))
-                import pafy
-
-                s = pafy.new(s).getbest(preftype="mp4").url  # YouTube URL
             s = eval(s) if s.isnumeric() else s  # i.e. s = '0' local webcam
-            if s == 0:
-                assert not is_colab(), "--source 0 webcam unsupported on Colab. Rerun command in a local environment."
-                assert not is_kaggle(), "--source 0 webcam unsupported on Kaggle. Rerun command in a local environment."
-            cap = cv2.VideoCapture(s)
-            assert cap.isOpened(), f"{st}Failed to open {s}"
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
-            self.frames[i] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float("inf")  # infinite stream fallback
-            self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
-
-            _, self.imgs[i] = cap.read()  # guarantee first frame
+            
+            # cv_image
+            cap = combined_image            
+            self.imgs[i] = cap   # guarantee first frame     
             self.threads[i] = Thread(target=self.update, args=([i, cap, s]), daemon=True)
-            LOGGER.info(f"{st} Success ({self.frames[i]} frames {w}x{h} at {self.fps[i]:.2f} FPS)")
             self.threads[i].start()
+
         LOGGER.info("")  # newline
 
         # check for common shapes
         s = np.stack([letterbox(x, img_size, stride=stride, auto=auto)[0].shape for x in self.imgs])
         self.rect = np.unique(s, axis=0).shape[0] == 1  # rect inference if all shapes equal
         self.auto = auto and self.rect
+        
         self.transforms = transforms  # optional
         if not self.rect:
             LOGGER.warning("WARNING ⚠️ Stream shapes differ. For optimal performance supply similarly-shaped streams.")
@@ -479,18 +496,9 @@ class LoadStreams:
     def update(self, i, cap, stream):
         """Reads frames from stream `i`, updating imgs array; handles stream reopening on signal loss."""
         n, f = 0, self.frames[i]  # frame number, frame array
-        while cap.isOpened() and n < f:
-            n += 1
-            cap.grab()  # .read() = .grab() followed by .retrieve()
-            if n % self.vid_stride == 0:
-                success, im = cap.retrieve()
-                if success:
-                    self.imgs[i] = im
-                else:
-                    LOGGER.warning("WARNING ⚠️ Video stream unresponsive, please check your IP camera connection.")
-                    self.imgs[i] = np.zeros_like(self.imgs[i])
-                    cap.open(stream)  # re-open stream if signal was lost
-            time.sleep(0.0)  # wait time
+        while not rospy.is_shutdown():
+            self.imgs[i] = combined_image
+            time.sleep(1/30)  # wait time
 
     def __iter__(self):
         """Resets and returns the iterator for iterating over video frames or images in a dataset."""
@@ -754,12 +762,6 @@ class LoadImagesAndLabels(Dataset):
     def __len__(self):
         """Returns the number of images in the dataset."""
         return len(self.im_files)
-
-    # def __iter__(self):
-    #     self.count = -1
-    #     print('ran dataset iter')
-    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
-    #     return self
 
     def __getitem__(self, index):
         """Fetches the dataset item at the given index, considering linear, shuffled, or weighted sampling."""
