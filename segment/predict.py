@@ -1,4 +1,4 @@
-# Ultralytics YOLOv5 🚀, AGPL-3.0 license
+# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
 """
 Run YOLOv5 segmentation inference on images, videos, directories, streams, etc.
 
@@ -34,6 +34,8 @@ import platform
 import sys
 from pathlib import Path
 
+import numpy as np
+
 import torch
 
 FILE = Path(__file__).resolve()
@@ -65,6 +67,9 @@ from utils.general import (
 from utils.segment.general import masks2segments, process_mask, process_mask_native
 from utils.torch_utils import select_device, smart_inference_mode
 
+import rospy
+from std_msgs.msg import Int32MultiArray
+import csv
 
 @smart_inference_mode()
 def run(
@@ -152,6 +157,8 @@ def run(
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
 
         # Process predictions
+        ## msg variable declaration
+        msg = Int32MultiArray()
         for i, det in enumerate(pred):  # per image
             seen += 1
             if webcam:  # batch_size >= 1
@@ -181,7 +188,7 @@ def run(
                         scale_segments(im0.shape if retina_masks else im.shape[2:], x, im0.shape, normalize=True)
                         for x in reversed(masks2segments(masks))
                     ]
-
+                    
                 # Print results
                 for c in det[:, 5].unique():
                     n = (det[:, 5] == c).sum()  # detections per class
@@ -196,7 +203,7 @@ def run(
                     if retina_masks
                     else im[i],
                 )
-
+                
                 # Write results
                 for j, (*xyxy, conf, cls) in enumerate(reversed(det[:, :6])):
                     if save_txt:  # Write to file
@@ -204,14 +211,31 @@ def run(
                         line = (cls, *seg, conf) if save_conf else (cls, *seg)  # label format
                         with open(f"{txt_path}.txt", "a") as f:
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
-
+                        
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
                         annotator.box_label(xyxy, label, color=colors(c, True))
                         # annotator.draw.polygon(segments[j], outline=colors(c, True), width=3)
+                        
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
+                    
+                    # person class data
+                    if int(cls) == 0 and conf >= 0.4:                        
+                        segment = [ scale_segments(im0.shape if retina_masks else im.shape[2:], x, im0.shape, normalize=False) for x in reversed(masks2segments(masks)) ]
+                        fin_segment_mid = []
+                        for s in range(0,len(segment)):
+                            polygon_points = segment[s]
+                            segment_mid = np.mean(polygon_points, axis=0)
+                            rounded_segment_mid = np.round(segment_mid).astype(int)
+                            fin_segment_mid.extend(rounded_segment_mid)
+                        
+                        msg.data = fin_segment_mid
+                        seg_pub(msg)
+                        
+                    else:
+                        pass
 
             # Stream results
             im0 = annotator.result()
@@ -243,26 +267,46 @@ def run(
                         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
                     vid_writer[i].write(im0)
 
+        ## No detection option
+        if len(det) == 0:
+            print("No Segmentation")
+            segment = []
+            msg.data = segment
+            seg_pub(msg)
+        else:
+            pass
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
 
     # Print results
     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
     LOGGER.info(f"Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}" % t)
+    
+    # FPS
+    total_time_ms = sum(t)  # t[0] + t[1] + t[2]
+    total_time_s = total_time_ms / 1000
+    fps = 1 / total_time_s if total_time_s > 0 else 0
+    print(f'FPS: {fps:.2f}')
+
+    
     if save_txt or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ""
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
-
+        
+# Segmentation Topic Pub
+def seg_pub(msg):
+    pub = rospy.Publisher('seg_coords', Int32MultiArray, queue_size=3)
+    pub.publish(msg)
 
 def parse_opt():
     """Parses command-line options for YOLOv5 inference including model paths, data sources, inference settings, and
     output preferences.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5s-seg.pt", help="model path(s)")
-    parser.add_argument("--source", type=str, default=ROOT / "data/images", help="file/dir/URL/glob/screen/0(webcam)")
+    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5n-seg.pt", help="model path(s)")
+    parser.add_argument("--source", type=str, default="0", help="file/dir/URL/glob/screen/0(webcam)")
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="(optional) dataset.yaml path")
     parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
     parser.add_argument("--conf-thres", type=float, default=0.25, help="confidence threshold")
